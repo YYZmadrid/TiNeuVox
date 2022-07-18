@@ -1,0 +1,15 @@
+{
+    "files.associations": {
+        "*.java": "java",
+        "*.py": "python",
+        "random": "cpp",
+        "array": "cpp",
+        "string": "cpp",
+        "string_view": "cpp",
+        "bitset": "cpp",
+        "initializer_list": "cpp",
+        "utility": "cpp",
+        "cmath": "cpp",
+        "complex": "cpp"
+    }
+}

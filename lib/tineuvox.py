@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 from torch_scatter import segment_coo
+from .hashtable import MultiHashtable
 
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 render_utils_cuda = load(
@@ -59,7 +60,7 @@ class Deformation(nn.Module):
     def forward(self, input_pts, ts):
         dx = self.query_time(input_pts, ts, self._time, self._time_out)
         input_pts_orig = input_pts[:, :3]
-        out=input_pts_orig + dx
+        out = input_pts_orig + dx
         return out
 
 # Model
@@ -76,11 +77,11 @@ class RGBNet(nn.Module):
         self.input_ch_times = times_ch
         self.output_ch = output_ch
         self.feature_linears = nn.Linear(self.input_ch, W)
-        self.views_linears = nn.Sequential(nn.Linear(W+self.input_ch_views, W//2),nn.ReLU(),nn.Linear(W//2, self.output_ch))
+        self.views_linears = nn.Sequential(nn.Linear(W+self.input_ch_views, W//2), nn.ReLU(), nn.Linear(W//2, self.output_ch))
         
     def forward(self, input_h, input_views):
         feature = self.feature_linears(input_h)
-        feature_views = torch.cat([feature, input_views],dim=-1)
+        feature_views = torch.cat([feature, input_views], dim=-1)
         outputs = self.views_linears(feature_views)
         return outputs
 
@@ -89,11 +90,16 @@ class TiNeuVox(torch.nn.Module):
     def __init__(self, xyz_min, xyz_max,
                  num_voxels=0, num_voxels_base=0, add_cam=False,
                  alpha_init=None, fast_color_thres=0,
+                 voxel_channel=3,
                  voxel_dim=0, defor_depth=3, net_width=128,
                  posbase_pe=10, viewbase_pe=4, timebase_pe=8, gridbase_pe=2,
+                 voxel_type='tineuvox',
+                 mhe_cfg=None,
                  **kwargs):
         
         super(TiNeuVox, self).__init__()
+        
+
         self.add_cam = add_cam
         self.voxel_dim = voxel_dim
         self.defor_depth = defor_depth
@@ -102,29 +108,30 @@ class TiNeuVox(torch.nn.Module):
         self.viewbase_pe = viewbase_pe
         self.timebase_pe = timebase_pe
         self.gridbase_pe = gridbase_pe
-        times_ch = 2*timebase_pe+1
-        views_ch = 3+3*viewbase_pe*2
-        pts_ch = 3+3*posbase_pe*2,
+        times_ch = 2 * timebase_pe + 1
+        views_ch = 3 + 3 * viewbase_pe * 2
+        pts_ch = 3 + 3 * posbase_pe * 2
         self.register_buffer('xyz_min', torch.Tensor(xyz_min))
         self.register_buffer('xyz_max', torch.Tensor(xyz_max))
         self.fast_color_thres = fast_color_thres
         # determine based grid resolution
         self.num_voxels_base = num_voxels_base
         self.voxel_size_base = ((self.xyz_max - self.xyz_min).prod() / self.num_voxels_base).pow(1/3)
+        self.voxel_channel = voxel_channel
 
         # determine the density bias shift
         self.alpha_init = alpha_init
-        self.act_shift = np.log(1/(1-alpha_init) - 1)
+        self.act_shift = np.log(1/ (1-alpha_init) - 1)
         print('TiNeuVox: set density bias shift to', self.act_shift)
 
         timenet_width = net_width
         timenet_depth = 1
-        timenet_output = voxel_dim+voxel_dim*2*gridbase_pe
+        timenet_output = voxel_dim * (2 * gridbase_pe + 1)
         self.timenet = nn.Sequential(
         nn.Linear(times_ch, timenet_width), nn.ReLU(inplace=True),
         nn.Linear(timenet_width, timenet_output))
         if self.add_cam == True:
-            views_ch = 3+3*viewbase_pe*2+timenet_output
+            views_ch = 3 + 3 * viewbase_pe * 2 + timenet_output
             self.camnet = nn.Sequential(
             nn.Linear(times_ch, timenet_width), nn.ReLU(inplace=True),
             nn.Linear(timenet_width, timenet_output))
@@ -132,8 +139,8 @@ class TiNeuVox(torch.nn.Module):
 
         featurenet_width = net_width
         featurenet_depth = 1
-        grid_dim = voxel_dim*3+voxel_dim*3*2*gridbase_pe
-        input_dim = grid_dim+timenet_output+0+0+3+3*posbase_pe*2
+        grid_dim = voxel_channel * voxel_dim * (2 * gridbase_pe + 1)
+        input_dim = grid_dim + timenet_output + pts_ch
         self.featurenet = nn.Sequential(
             nn.Linear(input_dim, featurenet_width), nn.ReLU(inplace=True),
             *[
@@ -153,16 +160,26 @@ class TiNeuVox(torch.nn.Module):
         self.register_buffer('view_poc', torch.FloatTensor([(2**i) for i in range(viewbase_pe)]))
 
         self.voxel_dim = voxel_dim
-        self.feature= torch.nn.Parameter(torch.zeros([1, self.voxel_dim, *self.world_size],dtype=torch.float32))
+        self.voxel_type = voxel_type
+        
+        if voxel_type == 'tineuvox':
+            self.feature= torch.nn.Parameter(torch.zeros([1, self.voxel_dim, *self.world_size],dtype=torch.float32))
+            self.mhe_cfg = None
+        elif voxel_type == 'mhe':
+            self.feature = MultiHashtable(hashtable_cfg=mhe_cfg, xyz_min=xyz_min, xyz_max=xyz_max)
+            self.mhe_cfg = mhe_cfg
+        else:
+            raise NotImplementedError()
+        
         self.rgbnet = RGBNet(W=net_width, h_ch=featurenet_width, views_ch=views_ch, pts_ch=pts_ch, times_ch=times_ch)
-
-        print('TiNeuVox: feature voxel grid', self.feature.shape)
+        
+        if voxel_type == 'tineuvox':
+            print('TiNeuVox: feature voxel grid', self.feature.shape)
         print('TiNeuVox: timenet mlp', self.timenet)
         print('TiNeuVox: deformation_net mlp', self.deformation_net)
         print('TiNeuVox: densitynet mlp', self.densitynet)
         print('TiNeuVox: featurenet mlp', self.featurenet)
         print('TiNeuVox: rgbnet mlp', self.rgbnet)
-
 
     def _set_grid_resolution(self, num_voxels):
         # Determine grid resolution
@@ -174,7 +191,6 @@ class TiNeuVox(torch.nn.Module):
         print('TiNeuVox: world_size      ', self.world_size)
         print('TiNeuVox: voxel_size_base ', self.voxel_size_base)
         print('TiNeuVox: voxel_size_ratio', self.voxel_size_ratio)
-
 
     def get_kwargs(self):
         return {
@@ -194,17 +210,23 @@ class TiNeuVox(torch.nn.Module):
             'timebase_pe':self.timebase_pe,
             'gridbase_pe':self.gridbase_pe,
             'add_cam': self.add_cam,
+            'voxel_type': self.voxel_type,
+            'voxel_channel': self.voxel_channel,
+            'mhe_cfg': self.mhe_cfg
         }
 
 
     @torch.no_grad()
     def scale_volume_grid(self, num_voxels):
-        print('TiNeuVox: scale_volume_grid start')
-        ori_world_size = self.world_size
-        self._set_grid_resolution(num_voxels)
-        print('TiNeuVox: scale_volume_grid scale world_size from', ori_world_size, 'to', self.world_size)
-        self.feature = torch.nn.Parameter(
-            F.interpolate(self.feature.data, size=tuple(self.world_size), mode='trilinear', align_corners=True))
+        if self.voxel_type == 'tineuvox':
+            print('TiNeuVox: scale_volume_grid start')
+            ori_world_size = self.world_size
+            self._set_grid_resolution(num_voxels)
+            print('TiNeuVox: scale_volume_grid scale world_size from', ori_world_size, 'to', self.world_size)
+            self.feature = torch.nn.Parameter(
+                F.interpolate(self.feature.data, size=tuple(self.world_size), mode='trilinear', align_corners=True))
+        else:
+            pass
  
     def feature_total_variation_add_grad(self, weight, dense_mode):
         weight = weight * self.world_size.max() / 128
@@ -215,7 +237,7 @@ class TiNeuVox(torch.nn.Module):
         '''Wrapper for the interp operation'''
         mode = 'bilinear'
         shape = xyz.shape[:-1]
-        xyz = xyz.reshape(1,1,1,-1,3)
+        xyz = xyz.reshape(1, 1, 1, -1, 3)
         ind_norm = ((xyz - self.xyz_min) / (self.xyz_max - self.xyz_min)).flip((-1,)) * 2 - 1
         ret_lst = [
             F.grid_sample(grid, ind_norm, mode=mode, align_corners=align_corners).reshape(grid.shape[1],-1).T.reshape(*shape,grid.shape[1])
@@ -239,29 +261,20 @@ class TiNeuVox(torch.nn.Module):
         vox_l = self.grid_sampler(ray_pts_delta, grid)
         vox_m = self.grid_sampler(ray_pts_delta, grid[:,:,::2,::2,::2])
         vox_s = self.grid_sampler(ray_pts_delta, grid[:,:,::4,::4,::4])
-        vox_feature = torch.cat((vox_l,vox_m,vox_s),-1)
+        vox_feature = torch.cat((vox_l,vox_m,vox_s), -1)
 
-        if len(vox_feature.shape)==1:
+        if len(vox_feature.shape) == 1:
             vox_feature_flatten = vox_feature.unsqueeze(0)
         else:
             vox_feature_flatten = vox_feature
-        
         return vox_feature_flatten
 
-
-    def get_mask(self, rays_o, rays_d, near, far, stepsize, **render_kwargs):
-        '''Check whether the rays hit the geometry or not'''
-        shape = rays_o.shape[:-1]
-        rays_o = rays_o.reshape(-1, 3).contiguous()
-        rays_d = rays_d.reshape(-1, 3).contiguous()
-        stepdist = stepsize * self.voxel_size
-        ray_pts, mask_outbbox, ray_id = render_utils_cuda.sample_pts_on_rays(
-                rays_o, rays_d, self.xyz_min, self.xyz_max, near, far, stepdist)[:3]
-        mask_inbbox = ~mask_outbbox
-        hit = torch.zeros([len(rays_o)], dtype=torch.bool)
-        hit[ray_id[mask_inbbox]] = 1
-        return hit.reshape(shape)
-
+    def set_ray_bounds(self, can_bounds):
+        self.ray_min = can_bounds[0]
+        self.ray_max = can_bounds[1]
+        assert torch.all(self.ray_min > self.xyz_min)
+        assert torch.all(self.ray_max < self.xyz_max)
+        
     def sample_ray(self, rays_o, rays_d, near, far, stepsize, is_train=False, **render_kwargs):
         '''Sample query points on rays.
         All the output points are sorted from near to far.
@@ -278,14 +291,14 @@ class TiNeuVox(torch.nn.Module):
         rays_d = rays_d.contiguous()
         stepdist = stepsize * self.voxel_size
         ray_pts, mask_outbbox, ray_id, step_id, N_steps, t_min, t_max = render_utils_cuda.sample_pts_on_rays(
-            rays_o, rays_d, self.xyz_min, self.xyz_max, near, far, stepdist)
+            rays_o, rays_d, self.ray_min, self.ray_max, near, far, stepdist)        
         mask_inbbox = ~mask_outbbox
         ray_pts = ray_pts[mask_inbbox]
         ray_id = ray_id[mask_inbbox]
         step_id = step_id[mask_inbbox]
-        return ray_pts, ray_id, step_id,mask_inbbox
+        return ray_pts, ray_id, step_id, mask_inbbox
 
-    def forward(self, rays_o, rays_d, viewdirs,times_sel, cam_sel=None,bg_points_sel=None,global_step=None, **render_kwargs):
+    def forward(self, rays_o, rays_d, viewdirs, times_sel, cam_sel=None, bg_points_sel=None, global_step=None, **render_kwargs):
         '''Volume rendering
         @rays_o:   [N, 3] the starting point of the N shooting rays.
         @rays_d:   [N, 3] the shooting direction of the N rays.
@@ -313,16 +326,20 @@ class TiNeuVox(torch.nn.Module):
             bg_points_sel_emb = poc_fre(bg_points_sel, self.pos_poc)
             bg_points_sel_delta = self.deformation_net(bg_points_sel_emb, times_feature[:(bg_points_sel_emb.shape[0])])
             ret_dict.update({'bg_points_delta': bg_points_sel_delta})
+        
         # voxel query interp
-        vox_feature_flatten=self.mult_dist_interp(ray_pts_delta)
+        if self.voxel_type == 'tineuvox':
+            vox_feature_flatten = self.mult_dist_interp(ray_pts_delta)
+        else:
+            vox_feature_flatten = self.feature(ray_pts_delta)
 
         times_feature = times_feature[ray_id]
         vox_feature_flatten_emb = poc_fre(vox_feature_flatten, self.grid_poc)
         h_feature = self.featurenet(torch.cat((vox_feature_flatten_emb, rays_pts_emb, times_feature), -1))
         density_result = self.densitynet(h_feature)
 
-        alpha = nn.Softplus()(density_result+self.act_shift)
-        alpha=alpha.squeeze(-1)
+        alpha = nn.Softplus()(density_result + self.act_shift)
+        alpha = alpha.squeeze(-1)
         if self.fast_color_thres > 0:
             mask = (alpha > self.fast_color_thres)
             ray_id = ray_id[mask]
@@ -390,185 +407,6 @@ class Alphas2Weights(torch.autograd.Function):
         return grad, None, None
 
 
-''' Ray and batch
-'''
-def get_rays(H, W, K, c2w, inverse_y=False, flip_x=False ,flip_y=False, mode='center'):
-    i, j = torch.meshgrid(
-        torch.linspace(0, W-1, W, device=c2w.device),
-        torch.linspace(0, H-1, H, device=c2w.device))  # pytorch's meshgrid has indexing='ij'
-    i = i.t().float()
-    j = j.t().float()
-    if mode == 'lefttop':
-        pass
-    elif mode == 'center':
-        i, j = i+0.5, j+0.5
-    elif mode == 'random':
-        i = i+torch.rand_like(i)
-        j = j+torch.rand_like(j)
-    else:
-        raise NotImplementedError
-
-    if flip_x:
-        i = i.flip((1,))
-    if flip_y:
-        j = j.flip((0,))
-    if inverse_y:
-        dirs = torch.stack([(i-K[0][2])/K[0][0], (j-K[1][2])/K[1][1], torch.ones_like(i)], -1)
-    else:
-        dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1)
-    # Rotate ray directions from camera frame to the world frame
-    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
-    # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = c2w[:3,3].expand(rays_d.shape)
-    return rays_o, rays_d
-
-def get_rays_np(H, W, K, c2w):
-    i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
-    dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
-    # Rotate ray directions from camera frame to the world frame
-    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
-    # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = np.broadcast_to(c2w[:3,3], np.shape(rays_d))
-    return rays_o, rays_d
-
-def ndc_rays(H, W, focal, near, rays_o, rays_d):
-    # Shift ray origins to near plane
-    t = -(near + rays_o[...,2]) / rays_d[...,2]
-    rays_o = rays_o + t[...,None] * rays_d
-
-    # Projection
-    o0 = -1./(W/(2.*focal)) * rays_o[...,0] / rays_o[...,2]
-    o1 = -1./(H/(2.*focal)) * rays_o[...,1] / rays_o[...,2]
-    o2 = 1. + 2. * near / rays_o[...,2]
-
-    d0 = -1./(W/(2.*focal)) * (rays_d[...,0]/rays_d[...,2] - rays_o[...,0]/rays_o[...,2])
-    d1 = -1./(H/(2.*focal)) * (rays_d[...,1]/rays_d[...,2] - rays_o[...,1]/rays_o[...,2])
-    d2 = -2. * near / rays_o[...,2]
-
-    rays_o = torch.stack([o0,o1,o2], -1)
-    rays_d = torch.stack([d0,d1,d2], -1)
-
-    return rays_o, rays_d
-
-def get_rays_of_a_view(H, W, K, c2w, ndc, mode='center'):
-    rays_o, rays_d = get_rays(H, W, K, c2w, mode=mode)
-    viewdirs = rays_d / rays_d.norm(dim=-1, keepdim=True)
-    if ndc:
-        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
-    return rays_o, rays_d, viewdirs
-
-@torch.no_grad()
-def get_training_rays(rgb_tr, times,train_poses, HW, Ks, ndc):
-    print('get_training_rays: start')
-    assert len(np.unique(HW, axis=0)) == 1
-    assert len(np.unique(Ks.reshape(len(Ks),-1), axis=0)) == 1
-    assert len(rgb_tr) == len(train_poses) and len(rgb_tr) == len(Ks) and len(rgb_tr) == len(HW)
-    H, W = HW[0]
-    K = Ks[0]
-    eps_time = time.time()
-    rays_o_tr = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
-    rays_d_tr = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
-    viewdirs_tr = torch.zeros([len(rgb_tr), H, W, 3], device=rgb_tr.device)
-    times_tr = torch.ones([len(rgb_tr), H, W, 1], device=rgb_tr.device)
-
-    imsz = [1] * len(rgb_tr)
-    for i, c2w in enumerate(train_poses):
-        rays_o, rays_d, viewdirs = get_rays_of_a_view(
-                H=H, W=W, K=K, c2w=c2w, ndc=ndc,)
-        rays_o_tr[i].copy_(rays_o.to(rgb_tr.device))
-        rays_d_tr[i].copy_(rays_d.to(rgb_tr.device))
-        viewdirs_tr[i].copy_(viewdirs.to(rgb_tr.device))
-        times_tr[i] = times_tr[i]*times[i]
-        del rays_o, rays_d, viewdirs
-    eps_time = time.time() - eps_time
-    print('get_training_rays: finish (eps time:', eps_time, 'sec)')
-    return rgb_tr, times_tr,rays_o_tr, rays_d_tr, viewdirs_tr, imsz
-
-
-@torch.no_grad()
-def get_training_rays_flatten(rgb_tr_ori, times,train_poses, HW, Ks, ndc):
-    print('get_training_rays_flatten: start')
-    assert len(rgb_tr_ori) == len(train_poses) and len(rgb_tr_ori) == len(Ks) and len(rgb_tr_ori) == len(HW)
-    eps_time = time.time()
-    DEVICE = rgb_tr_ori[0].device
-    N = sum(im.shape[0] * im.shape[1] for im in rgb_tr_ori)
-    rgb_tr = torch.zeros([N,3], device=DEVICE)
-    rays_o_tr = torch.zeros_like(rgb_tr)
-    rays_d_tr = torch.zeros_like(rgb_tr)
-    viewdirs_tr = torch.zeros_like(rgb_tr)
-    times_tr=torch.ones([N,1], device=DEVICE)
-    times=times.unsqueeze(-1)
-    imsz = []
-    top = 0
-    for c2w, img, (H, W), K ,time_one in zip(train_poses, rgb_tr_ori, HW, Ks,times):
-        assert img.shape[:2] == (H, W)
-        rays_o, rays_d, viewdirs = get_rays_of_a_view(
-                H=H, W=W, K=K, c2w=c2w, ndc=ndc,)
-        n = H * W
-        times_tr[top:top+n]=times_tr[top:top+n]*time_one
-        rgb_tr[top:top+n].copy_(img.flatten(0,1))
-        rays_o_tr[top:top+n].copy_(rays_o.flatten(0,1).to(DEVICE))
-        rays_d_tr[top:top+n].copy_(rays_d.flatten(0,1).to(DEVICE))
-        viewdirs_tr[top:top+n].copy_(viewdirs.flatten(0,1).to(DEVICE))
-        imsz.append(n)
-        top += n
-    assert top == N
-    eps_time = time.time() - eps_time
-    print('get_training_rays_flatten: finish (eps time:', eps_time, 'sec)')
-    return rgb_tr, times_tr,rays_o_tr, rays_d_tr, viewdirs_tr, imsz
-
-
-@torch.no_grad()
-def get_training_rays_in_maskcache_sampling(rgb_tr_ori, times,train_poses, HW, Ks, ndc, model, render_kwargs):
-    print('get_training_rays_in_maskcache_sampling: start')
-    assert len(rgb_tr_ori) == len(train_poses) and len(rgb_tr_ori) == len(Ks) and len(rgb_tr_ori) == len(HW)
-    CHUNK = 64
-    DEVICE = rgb_tr_ori[0].device
-    eps_time = time.time()
-    N = sum(im.shape[0] * im.shape[1] for im in rgb_tr_ori)
-    rgb_tr = torch.zeros([N,3], device=DEVICE)
-    rays_o_tr = torch.zeros_like(rgb_tr)
-    rays_d_tr = torch.zeros_like(rgb_tr)
-    viewdirs_tr = torch.zeros_like(rgb_tr)
-    times_tr = torch.ones([N,1], device=DEVICE)
-    times = times.unsqueeze(-1)
-    imsz = []
-    top = 0
-    for c2w, img, (H, W), K ,time_one in zip(train_poses, rgb_tr_ori, HW, Ks,times):
-        assert img.shape[:2] == (H, W)
-        rays_o, rays_d, viewdirs = get_rays_of_a_view(
-                H=H, W=W, K=K, c2w=c2w, ndc=ndc,)
-        mask = torch.empty(img.shape[:2], device=DEVICE, dtype=torch.bool)
-        for i in range(0, img.shape[0], CHUNK):
-            mask[i:i+CHUNK] = model.get_mask(
-                    rays_o=rays_o[i:i+CHUNK], rays_d=rays_d[i:i+CHUNK], **render_kwargs).to(DEVICE)
-        n = mask.sum()
-        times_tr[top:top+n]=times_tr[top:top+n]*time_one
-        rgb_tr[top:top+n].copy_(img[mask])
-        rays_o_tr[top:top+n].copy_(rays_o[mask].to(DEVICE))
-        rays_d_tr[top:top+n].copy_(rays_d[mask].to(DEVICE))
-        viewdirs_tr[top:top+n].copy_(viewdirs[mask].to(DEVICE))
-        imsz.append(n)
-        top += n
-
-    print('get_training_rays_in_maskcache_sampling: ratio', top / N)
-    rgb_tr = rgb_tr[:top]
-    rays_o_tr = rays_o_tr[:top]
-    rays_d_tr = rays_d_tr[:top]
-    viewdirs_tr = viewdirs_tr[:top]
-    eps_time = time.time() - eps_time
-    print('get_training_rays_in_maskcache_sampling: finish (eps time:', eps_time, 'sec)')
-    return rgb_tr, times_tr,rays_o_tr, rays_d_tr, viewdirs_tr, imsz
-
-
-def batch_indices_generator(N, BS):
-    # torch.randperm on cuda produce incorrect results in my machine
-    idx, top = torch.LongTensor(np.random.permutation(N)), 0
-    while True:
-        if top + BS > N:
-            idx, top = torch.LongTensor(np.random.permutation(N)), 0
-        yield idx[top:top+BS]
-        top += BS
 
 def poc_fre(input_data,poc_buf):
 

@@ -5,14 +5,25 @@ import torch
 
 from .load_dnerf import load_dnerf_data
 from .load_hyper import Load_hyper_data
-
+from .load_light_stage import load_light_stage_data
 
 def load_data(args):
 
     K, depths = None, None
     times=None
 
-    if args.dataset_type == 'hyper_dataset':
+    if args.dataset_type == 'light_stage':
+        dataset = load_light_stage_data(**args)
+        data_dict = dict(
+            dataset = dataset,
+            near = args.near, far = args.far,
+            render_poses = dataset.render_poses,
+            xyz_min = dataset.xyz_min,
+            xyz_max = dataset.xyz_max
+        )
+        return data_dict
+    
+    elif args.dataset_type == 'hyper_dataset':
         data_class=Load_hyper_data(datadir=args.datadir,
                                     use_bg_points=args.use_bg_points, add_cam=args.add_cam)
         data_dict = dict(
