@@ -36,30 +36,26 @@ class MultiHashtable(nn.Module):
             torch.zeros((self.n_levels, self.n_entrys_per_level, self.f)))
         nn.init.kaiming_normal_(self.data)
 
-        
         bbox = xyz_min.tolist() + xyz_max.tolist()
         self.bounds = torch.tensor(np.array(bbox).reshape((2, 3))).float().cuda()
         self.offsets = torch.tensor([[0., 0., 0.], [0., 0., 1.], [0., 1., 0.], [0., 1., 1.], 
                                      [1., 0., 0.], [1., 0., 1.], [1., 1., 0.], [1., 1., 1.]]).float().cuda()
 
         
-        self.entrys_size, self.entrys_num, self.voxel_num = [], [], []
+        self.entrys_size, self.entrys_num, = [], []
         for i in range(self.n_levels):
-            self.voxel_num.append(int((self.base_resolution * self.b**i) ** 3))
-            __import__('ipdb').set_trace()
-            voxel_size = ((xyz_max - xyz_min).prod() / self.voxel_num[i]) ** (1 / 3)
-            world_size = ((xyz_max - xyz_min) / voxel_size).astype(np.int64)
-            assert world_size.prod() < self.voxel_num[i]
+            grid_num = int((self.base_resolution * self.b**i) ** 3)
+            grid_size = ((xyz_max - xyz_min).prod() / grid_num) ** (1 / 3)
+            world_size = ((xyz_max - xyz_min) / grid_size).astype(np.int64)
             self.entrys_num.append(world_size)
-            self.entrys_size.append(self.bounds / (self.entrys_num[i] - 1))
-        
+            self.entrys_size.append((xyz_max - xyz_min) / (self.entrys_num[i] - 1))
         self.entrys_size = torch.tensor(self.entrys_size).cuda()
         self.entrys_num = torch.tensor(self.entrys_num).cuda()
         self.entrys_min = torch.zeros_like(self.entrys_num).cuda()
         
         self.start_hash = self.n_levels
-        for i, n in enumerate(self.voxel_num):
-            if n > self.data.shape[1]:
+        for i, n in enumerate(self.entrys_num):
+            if n.prod() > self.data.shape[1]:
                 self.start_hash = i
                 break
 
@@ -67,24 +63,26 @@ class MultiHashtable(nn.Module):
         """
         xyz: n_points, 3
         """
-        __import__('ipdb').set_trace()
-
         ind_xyz = xyz[None].repeat(self.n_levels, 1, 1)
-        float_xyz = (ind_xyz - self.bounds[0][None, None]) / self.entrys_size[:, None, None]
-        int_xyz = (float_xyz[:, :, None] + self.offsets[None, None]).long()
-        offset_xyz = float_xyz - int_xyz[:, :, 0]
+        float_xyz = (ind_xyz - self.bounds[0][None, None]) / self.entrys_size[:, None, :] # [L, N, 3]
+        int_xyz = (float_xyz[:, :, None] + self.offsets[None, None]).long() # [L, N, 8, 3]
+        offset_xyz = float_xyz - int_xyz[:, :, 0] # [L, N, 3]  offset for each point in 3d grid
         int_xyz = torch.stack([
-            torch.clamp(int_xyz[i], min=self.entrys_min[i].item(), max=self.entrys_num[i].item() - 1)
+            torch.clamp(int_xyz[i], min=self.entrys_min[i], max=self.entrys_num[i] - 1)
             for i in range(self.n_levels)])
         # Only available under torch 1.10 with cuda 11.3
         # int_xyz = torch.clamp(int_xyz.transpose(0, -1), min=self.entrys_min, max=self.entrys_num-1).transpose(0, -1)
         ind = torch.zeros_like(int_xyz[..., 0])
+        __import__('ipdb').set_trace()
 
         sh = self.start_hash
-        ind[:sh] = int_xyz[:sh, ..., 0] * (self.entrys_num[:sh]**2)[:, None, None] + \
-                   int_xyz[:sh, ..., 1] * (self.entrys_num[:sh])[:, None, None] + \
-                   int_xyz[:sh, ..., 2]                   
-        nl = self.n_levels
+        # ind[:sh] = int_xyz[:sh, ..., 0] * (self.entrys_num[:sh]**2)[:, None, None] + \
+        #            int_xyz[:sh, ..., 1] * (self.entrys_num[:sh])[:, None, None] + \
+        #            int_xyz[:sh, ..., 2]         
+        ind[:sh] = int_xyz[:sh, ..., 0] * self.entrys_num[:sh, 1][:, None, None] * self.entrys_num[:sh, 2][:, None, None] + \
+                   int_xyz[:sh, ..., 1] * self.entrys_num[:sh, 2][:, None, None] + \
+                   int_xyz[:sh, ..., 2]
+        nl = self.n_levels 
         ind[sh:nl] = torch.bitwise_xor(
             torch.bitwise_xor(int_xyz[sh:nl, ..., 0] * self.ps[0],
                               int_xyz[sh:nl, ..., 1] * self.ps[1]),

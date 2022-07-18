@@ -15,6 +15,7 @@ data = dict(
 
 train_config = dict(
     N_iters = 30000,
+    N_rand = 1024,
 )
 
 model_and_render = dict(

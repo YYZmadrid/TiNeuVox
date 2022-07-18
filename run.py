@@ -49,6 +49,11 @@ def config_parser():
                         help='frequency of test')
     parser.add_argument("--step_to_half", type=int, default=19000,
                         help='The iteration when fp32 becomes fp16')
+    
+    # gpus
+    parser.add_argument("--gpus", type=int, nargs='+')
+    
+    
     return parser
 
 @torch.no_grad()
@@ -309,6 +314,10 @@ if __name__=='__main__':
         device = torch.device('cpu')
     seed_everything()
     data_dict = None
+    
+    # set GPU environ
+    os.environ['CUDA_VISIBLE_DEVICES'] = ', '.join([str(gpu) for gpu in args.gpus])
+
     # load images / poses / camera settings / data split
     data_dict = load_everything(args = args, cfg = cfg)
 

@@ -52,11 +52,13 @@ class Dataset():
 
     
     def get_mask(self, index):
-        msk_path = os.path.join(self.data_root, 'mask_cihp',
-                                self.ims[index])[:-4] + '.png'
+        if self.data_dict['human'] in ['CoreView_313', 'CoreView_315']:
+            msk_path = os.path.join(self.data_root, 'mask', self.ims[index])[:-4] + '.png'
+        else:
+            msk_path = os.path.join(self.data_root, 'mask_cihp', self.ims[index])[:-4] + '.png'
+
         msk_cihp = imageio.v2.imread(msk_path)
         msk = (msk_cihp != 0).astype(np.uint8)
-
         border = 5
         kernel = np.ones((border, border), np.uint8)
         msk_erode = cv2.erode(msk.copy(), kernel)
