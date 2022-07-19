@@ -49,7 +49,6 @@ class Dataset():
         self.nrays = data_dict['N_rand']
         self.xyz_min, self.xyz_max = self.get_bounds(i, ni * i_intv)
         self.can_bounds = np.stack([self.xyz_min, self.xyz_max], axis=0)
-
     
     def get_mask(self, index):
         msk_path = os.path.join(self.data_root, 'mask_cihp', self.ims[index])[:-4] + '.png'
@@ -250,7 +249,7 @@ def sample_ray_h36m(img, msk, K, R, T, bounds, nrays, split):
         
     if split == 'train':
         nsampled_rays = 0
-        body_sample_ratio = 0.8
+        body_sample_ratio = 0.95
         ray_o_list = []
         ray_d_list = []
         rgb_list = []

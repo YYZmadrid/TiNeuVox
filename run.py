@@ -47,9 +47,9 @@ def config_parser():
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100,
                         help='frequency of console printout and metric loggin')
-    parser.add_argument("--fre_test", type=int, default=50000,
+    parser.add_argument("--fre_test", type=int, default=200000,
                         help='frequency of test')
-    parser.add_argument("--step_to_half", type=int, default=19000,
+    parser.add_argument("--step_to_half", type=int, default=200000,
                         help='The iteration when fp32 becomes fp16')
     
     # gpus
@@ -269,7 +269,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             writer.add_scalar('train/rgbper_loss', rgbper_loss.item(), global_step)
             writer.add_scalar('train/psnr', np.mean(psnr_lst), global_step)
             psnr_lst = []
-            
+                    
     if global_step != -1:
         torch.save({
             'global_step': global_step,

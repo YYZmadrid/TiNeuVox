@@ -79,7 +79,6 @@ class MultiHashtable4d(nn.Module):
         """
         
         # shift t to change its starting time
-
         t = t - self.start_frame / (self.total_frame - 1)
         assert torch.max(t).item() <= (self.end_frame) / (self.total_frame - 1)
         
@@ -114,12 +113,10 @@ class MultiHashtable4d(nn.Module):
         weights_xyzt = torch.clamp(
             (1 - self.offsets[None, None]) + (2 * self.offsets[None, None] - 1.) * offset_xyzt[:, :, None],
             min=0., max=1.)
-        weights_xyzt = weights_xyzt[..., 0] * weights_xyzt[..., 1] * weights_xyzt[..., 2] * weights_xyzt[..., 3]
-
+        weights_xyzt = torch.prod(weights_xyzt, dim=-1)
         val = (weights_xyzt[..., None] * val).sum(dim=-2)
         val = val.permute(1, 0, 2).reshape(-1, nl * self.f)
         return val
-
 
 class MHE4d(nn.Module):
     def __init__(self, hashtable_cfg, xyz_min, xyz_max, frame_cfg):

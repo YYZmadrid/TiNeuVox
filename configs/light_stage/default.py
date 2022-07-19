@@ -33,7 +33,6 @@ data = dict(
 '''
 train_config = dict(
     N_iters=30000,                # number of optimization steps
-    # N_rand=4096,                  # batch size (number of random rays per optimization step)
     lrate_feature=8e-2,           # lr of  voxel grid
     lrate_featurenet=8e-4,
     lrate_deformation_net=6e-4,

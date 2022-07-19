@@ -147,7 +147,13 @@ class TiNeuVox(torch.nn.Module):
 
         featurenet_width = net_width
         featurenet_depth = 1
-        grid_dim = voxel_channel * voxel_dim * (2 * gridbase_pe + 1)
+        
+        if voxel_type == 'tineuvox':
+            grid_dim = voxel_channel * voxel_dim * (2 * gridbase_pe + 1)
+        elif voxel_type == 'mhe' or 'mhe4d':
+            grid_dim = voxel_channel * voxel_dim
+
+        
         if voxel_type == 'tineuvox' or voxel_type == 'mhe':
             input_dim = grid_dim + timenet_output + pts_ch
         elif voxel_type == 'mhe4d':
@@ -227,13 +233,15 @@ class TiNeuVox(torch.nn.Module):
 
     @torch.no_grad()
     def scale_volume_grid(self, num_voxels):
-        print('TiNeuVox: scale_volume_grid start')
-        ori_world_size = self.world_size
-        self._set_grid_resolution(num_voxels)
-        print('TiNeuVox: scale_volume_grid scale world_size from', ori_world_size, 'to', self.world_size)
-        if self.voxel_type == 'tineuvox':
+        if self.voxel_type == 'tineuvox':    
+            print('TiNeuVox: scale_volume_grid start')
+            ori_world_size = self.world_size
+            self._set_grid_resolution(num_voxels)
+            print('TiNeuVox: scale_volume_grid scale world_size from', ori_world_size, 'to', self.world_size)
             self.feature = torch.nn.Parameter(
                 F.interpolate(self.feature.data, size=tuple(self.world_size), mode='trilinear', align_corners=True))
+        else:
+            pass
  
     def feature_total_variation_add_grad(self, weight, dense_mode):
         weight = weight * self.world_size.max() / 128
@@ -324,7 +332,8 @@ class TiNeuVox(torch.nn.Module):
             time = times_sel[0]
             time_pts = torch.ones_like(ray_pts[..., :1]) * time
             voxel_feature_flatten = self.feature(ray_pts, time_pts)
-            voxel_feature_flatten_emb = poc_fre(voxel_feature_flatten, self.grid_poc)
+            # voxel_feature_flatten_emb = poc_fre(voxel_feature_flatten, self.grid_poc)
+            voxel_feature_flatten_emb = voxel_feature_flatten
             h_feature = self.featurenet(voxel_feature_flatten_emb)
         else:
             times_emb = poc_fre(times_sel, self.time_poc)
@@ -345,11 +354,12 @@ class TiNeuVox(torch.nn.Module):
             # voxel query interp
             if self.voxel_type == 'tineuvox':
                 voxel_feature_flatten = self.mult_dist_interp(ray_pts_delta)
+                voxel_feature_flatten_emb = poc_fre(voxel_feature_flatten, self.grid_poc)
             else:
                 voxel_feature_flatten = self.feature(ray_pts_delta)
+                voxel_feature_flatten_emb = voxel_feature_flatten
 
             times_feature = times_feature[ray_id]
-            voxel_feature_flatten_emb = poc_fre(voxel_feature_flatten, self.grid_poc)
             h_feature = self.featurenet(torch.cat((voxel_feature_flatten_emb, rays_pts_emb, times_feature), -1))
         
         density_result = self.densitynet(h_feature)
