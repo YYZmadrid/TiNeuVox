@@ -41,22 +41,20 @@ class Dataset():
             for ims_data in annots['ims'][i:i + ni * i_intv][::i_intv]]).ravel()
         
         if self.data_dict['human'] in ['CoreView_313', 'CoreView_315']:
-            self.frame_inds = np.array([int(img_path.split('_')[4]) for img_path in self.ims])
+            self.frame_inds = np.array([int(img_path.split('_')[4])-1 for img_path in self.ims])
         else:
             self.frame_inds = np.array([int(img_path[-10:-4]) for img_path in self.ims])
 
-        self.times = (self.frame_inds - i) / (ni * i_intv)
+        self.times = (self.frame_inds - i) / (ni * i_intv - 1)
         self.nrays = data_dict['N_rand']
         self.xyz_min, self.xyz_max = self.get_bounds(i, ni * i_intv)
         self.can_bounds = np.stack([self.xyz_min, self.xyz_max], axis=0)
 
     
     def get_mask(self, index):
-        if self.data_dict['human'] in ['CoreView_313', 'CoreView_315']:
+        msk_path = os.path.join(self.data_root, 'mask_cihp', self.ims[index])[:-4] + '.png'
+        if not os.path.exists(msk_path):
             msk_path = os.path.join(self.data_root, 'mask', self.ims[index])[:-4] + '.png'
-        else:
-            msk_path = os.path.join(self.data_root, 'mask_cihp', self.ims[index])[:-4] + '.png'
-
         msk_cihp = imageio.v2.imread(msk_path)
         msk = (msk_cihp != 0).astype(np.uint8)
         border = 5
@@ -69,6 +67,8 @@ class Dataset():
 
     def get_bounds(self, start, length):
         for i in range(start, start+length):
+            if self.data_dict['human'] not in ['CoreView_313', 'CoreView_315']:
+                i = i + 1
             vertices_path = os.path.join(self.data_root, 'new_vertices', '{}.npy'.format(i))
             xyz = np.load(vertices_path).astype(np.float32)
             
@@ -109,7 +109,6 @@ class Dataset():
             if self.data_dict['white_bkgd']:
                 img[msk == 0] = 1
             K[:2] = K[:2] * self.data_dict['ratio']
-            
             frame_index = self.frame_inds[index]
             can_bounds = self.get_bounds(frame_index, 1)
                     
@@ -124,12 +123,17 @@ class Dataset():
             T = pose[:3, 3:]
             H, W = int(1024 * self.data_dict['ratio']), int(1024 * self.data_dict['ratio'])
             img, msk = np.zeros((H, W, 3)), np.zeros((H, W))
-            frame_index = self.data_dict['begin_ith_frame'] + int(index * self.data_dict['frame_interval'] * self.num_train_frames / self.data_dict['num_render_views'] )
-            can_bounds = self.get_bounds(frame_index, 2)
+            frame_index = self.data_dict['begin_ith_frame'] + \
+                int(index * self.data_dict['frame_interval'] * self.num_train_frames / (self.data_dict['num_render_views']-1))
+                
+            if frame_index == self.data_dict['begin_ith_frame'] + self.data_dict['frame_interval'] * self.num_train_frames:
+                can_bounds = self.get_bounds(frame_index, 1)
+            else:
+                can_bounds = self.get_bounds(frame_index, 2)
             rgb, rays_o, rays_d, coord, mask_at_box = sample_ray_h36m(img, msk, K, R, T, can_bounds, self.nrays, split)            
             occ = (msk[coord[:, 0], coord[:, 1]] == 1).astype(np.int32)
             viewdirs = rays_d / np.linalg.norm(rays_d, axis=-1, keepdims=True)
-            times = np.ones_like(rays_o)[..., :1] * index / self.data_dict['num_render_views'] 
+            times = np.ones_like(rays_o)[..., :1] * index / (self.data_dict['num_render_views']-1)
 
         rgb = torch.Tensor(rgb)
         rays_o = torch.Tensor(rays_o)

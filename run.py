@@ -2,8 +2,10 @@ import argparse
 import copy
 import os
 import random
+from selectors import EpollSelector
 import time
 from builtins import print
+from tkinter import NO
 
 import imageio
 import mmcv
@@ -51,7 +53,7 @@ def config_parser():
                         help='The iteration when fp32 becomes fp16')
     
     # gpus
-    parser.add_argument("--gpus", type=int, nargs='+')
+    parser.add_argument("--gpus", type=int, nargs='+', default=[0])
     
     
     return parser
@@ -68,7 +70,6 @@ def render_viewpoints_light_stage(model, data_dict, render_kwargs, ndc, savedir=
     render_poses = dataset.render_poses
     for i, w2c in enumerate(tqdm(render_poses)):
         rgb, rays_o, rays_d, viewdirs, time_one, occ, mask_at_box, can_bounds = dataset.get_rays(split='test', index=i)  
-        model.set_ray_bounds(can_bounds)
         
         keys = ['rgb_marched', 'depth', 'alphainv_last']
         rays_o = rays_o.flatten(0, -2)
@@ -153,10 +154,6 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
         xyz_min -= xyz_shift
         xyz_max += xyz_shift
         
-    if cfg.data.dataset_type == 'light_stage':
-        near = 2.
-        far = 6.
-    
     last_ckpt_path = os.path.join(cfg.basedir, cfg.expname, 'fine_last.tar')
     writer = SummaryWriter(os.path.join(cfg.basedir, 'summaries', cfg.expname))
     
@@ -168,17 +165,29 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     num_voxels = model_kwargs.pop('num_voxels')
     if len(cfg_train.pg_scale) :
         num_voxels = int(num_voxels / (2**len(cfg_train.pg_scale)))
+
+    voxel_type = model_kwargs.pop('voxel_type')
+    if voxel_type == "mhe4d":
+        frame_cfg = {
+            'begin_ith_frame': cfg.data.begin_ith_frame,
+            'num_train_frame': cfg.data.num_train_frame,
+            'split_frame': cfg.data.split_frame,
+        }
+    else:
+        frame_cfg = None
     model = tineuvox.TiNeuVox(
         xyz_min=xyz_min, xyz_max=xyz_max,
         num_voxels=num_voxels,
+        voxel_type=voxel_type,
+        frame_cfg=frame_cfg,
         **model_kwargs)
     model = model.to(device)
     optimizer = utils.create_optimizer_or_freeze_model(model, cfg_train, global_step=0)
 
     # init rendering setup
     render_kwargs = {
-        'near': near,
-        'far': far,
+        'near': data_dict['near'],
+        'far': data_dict['far'],
         'bg': 1 if cfg.data.white_bkgd else 0,
         'stepsize': cfg_model.stepsize,
     }
@@ -218,7 +227,6 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             times_sel = times_sel.to(device)
             can_bounds = can_bounds.to(device)
         # volume rendering
-        model.set_ray_bounds(can_bounds)
         render_result = model(rays_o, rays_d, viewdirs, times_sel, global_step=global_step, **render_kwargs)
 
         # gradient descent step
@@ -262,9 +270,6 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             writer.add_scalar('train/psnr', np.mean(psnr_lst), global_step)
             psnr_lst = []
             
-
-       
-
     if global_step != -1:
         torch.save({
             'global_step': global_step,
@@ -312,12 +317,10 @@ if __name__=='__main__':
         device = torch.device('cuda')
     else:
         device = torch.device('cpu')
+    torch.cuda.set_device(args.gpus[0])
     seed_everything()
     data_dict = None
     
-    # set GPU environ
-    os.environ['CUDA_VISIBLE_DEVICES'] = ', '.join([str(gpu) for gpu in args.gpus])
-
     # load images / poses / camera settings / data split
     data_dict = load_everything(args = args, cfg = cfg)
 

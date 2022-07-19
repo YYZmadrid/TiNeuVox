@@ -68,7 +68,7 @@ model_and_render = dict(
     fast_color_thres=1e-4,           # threshold of alpha value to skip the fine stage sampled point
     stepsize=0.5,                 # sampling stepsize in volume rendering
     world_bound_scale=1.05,
-    voxel_type='tineuvox'
+    voxel_type='tineuvox',
 )
 
 

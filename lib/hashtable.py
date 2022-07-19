@@ -41,17 +41,17 @@ class MultiHashtable(nn.Module):
         self.offsets = torch.tensor([[0., 0., 0.], [0., 0., 1.], [0., 1., 0.], [0., 1., 1.], 
                                      [1., 0., 0.], [1., 0., 1.], [1., 1., 0.], [1., 1., 1.]]).float().cuda()
 
-        
         self.entrys_size, self.entrys_num, = [], []
         for i in range(self.n_levels):
             grid_num = int((self.base_resolution * self.b**i) ** 3)
             grid_size = ((xyz_max - xyz_min).prod() / grid_num) ** (1 / 3)
-            world_size = ((xyz_max - xyz_min) / grid_size).astype(np.int64)
+            world_size = ((xyz_max - xyz_min) / grid_size).astype(np.int32)
             self.entrys_num.append(world_size)
+            __import__('ipdb').set_trace()
             self.entrys_size.append((xyz_max - xyz_min) / (self.entrys_num[i] - 1))
-        self.entrys_size = torch.tensor(self.entrys_size).cuda()
-        self.entrys_num = torch.tensor(self.entrys_num).cuda()
-        self.entrys_min = torch.zeros_like(self.entrys_num).cuda()
+        self.entrys_size = torch.tensor(self.entrys_size).float().cuda()
+        self.entrys_num = torch.tensor(self.entrys_num).int().cuda()
+        self.entrys_min = torch.zeros_like(self.entrys_num).int().cuda()
         
         self.start_hash = self.n_levels
         for i, n in enumerate(self.entrys_num):
@@ -72,13 +72,10 @@ class MultiHashtable(nn.Module):
             for i in range(self.n_levels)])
         # Only available under torch 1.10 with cuda 11.3
         # int_xyz = torch.clamp(int_xyz.transpose(0, -1), min=self.entrys_min, max=self.entrys_num-1).transpose(0, -1)
-        ind = torch.zeros_like(int_xyz[..., 0])
-        __import__('ipdb').set_trace()
+        ind = torch.zeros_like(int_xyz[..., 0]) # [L, N, 8]
+        # __import__('ipdb').set_trace()
 
-        sh = self.start_hash
-        # ind[:sh] = int_xyz[:sh, ..., 0] * (self.entrys_num[:sh]**2)[:, None, None] + \
-        #            int_xyz[:sh, ..., 1] * (self.entrys_num[:sh])[:, None, None] + \
-        #            int_xyz[:sh, ..., 2]         
+        sh = self.start_hash       
         ind[:sh] = int_xyz[:sh, ..., 0] * self.entrys_num[:sh, 1][:, None, None] * self.entrys_num[:sh, 2][:, None, None] + \
                    int_xyz[:sh, ..., 1] * self.entrys_num[:sh, 2][:, None, None] + \
                    int_xyz[:sh, ..., 2]
@@ -93,10 +90,8 @@ class MultiHashtable(nn.Module):
         val = val.reshape(nl, -1, 8, self.f)
 
         weights_xyz = torch.clamp(
-            (1 - self.offsets[None, None]) +
-            (2 * self.offsets[None, None] - 1.) * offset_xyz[:, :, None],
-            min=0.,
-            max=1.)
+            (1 - self.offsets[None, None]) + (2 * self.offsets[None, None] - 1.) * offset_xyz[:, :, None],
+            min=0., max=1.)
         weights_xyz = weights_xyz[..., 0] * weights_xyz[..., 1] * weights_xyz[..., 2]
 
         val = (weights_xyz[..., None] * val).sum(dim=-2)

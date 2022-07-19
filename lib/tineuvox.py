@@ -5,12 +5,14 @@ import time
 from tkinter import W
 
 import numpy as np
+from sympy import Mul
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 from torch_scatter import segment_coo
 from .hashtable import MultiHashtable
+from .hashtable4d import MHE4d
 
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 render_utils_cuda = load(
@@ -95,11 +97,12 @@ class TiNeuVox(torch.nn.Module):
                  posbase_pe=10, viewbase_pe=4, timebase_pe=8, gridbase_pe=2,
                  voxel_type='tineuvox',
                  mhe_cfg=None,
+                 frame_cfg=None,
                  **kwargs):
         
         super(TiNeuVox, self).__init__()
-        
-
+        self.register_buffer('xyz_min', torch.Tensor(xyz_min))
+        self.register_buffer('xyz_max', torch.Tensor(xyz_max))
         self.add_cam = add_cam
         self.voxel_dim = voxel_dim
         self.defor_depth = defor_depth
@@ -111,36 +114,45 @@ class TiNeuVox(torch.nn.Module):
         times_ch = 2 * timebase_pe + 1
         views_ch = 3 + 3 * viewbase_pe * 2
         pts_ch = 3 + 3 * posbase_pe * 2
-        self.register_buffer('xyz_min', torch.Tensor(xyz_min))
-        self.register_buffer('xyz_max', torch.Tensor(xyz_max))
         self.fast_color_thres = fast_color_thres
-        # determine based grid resolution
         self.num_voxels_base = num_voxels_base
         self.voxel_size_base = ((self.xyz_max - self.xyz_min).prod() / self.num_voxels_base).pow(1/3)
-        self.voxel_channel = voxel_channel
+        self.voxel_channel = voxel_channel        
+        self.register_buffer('time_poc', torch.FloatTensor([(2**i) for i in range(timebase_pe)]))
+        self.register_buffer('grid_poc', torch.FloatTensor([(2**i) for i in range(gridbase_pe)]))
+        self.register_buffer('pos_poc', torch.FloatTensor([(2**i) for i in range(posbase_pe)]))
+        self.register_buffer('view_poc', torch.FloatTensor([(2**i) for i in range(viewbase_pe)]))
+        self._set_grid_resolution(num_voxels)
 
         # determine the density bias shift
         self.alpha_init = alpha_init
         self.act_shift = np.log(1/ (1-alpha_init) - 1)
         print('TiNeuVox: set density bias shift to', self.act_shift)
-
-        timenet_width = net_width
-        timenet_depth = 1
-        timenet_output = voxel_dim * (2 * gridbase_pe + 1)
-        self.timenet = nn.Sequential(
-        nn.Linear(times_ch, timenet_width), nn.ReLU(inplace=True),
-        nn.Linear(timenet_width, timenet_output))
-        if self.add_cam == True:
-            views_ch = 3 + 3 * viewbase_pe * 2 + timenet_output
-            self.camnet = nn.Sequential(
+        
+        if voxel_type == 'tineuvox' or voxel_type == 'mhe':
+            timenet_width = net_width
+            timenet_depth = 1
+            timenet_output = voxel_dim * (2 * gridbase_pe + 1)
+            self.timenet = nn.Sequential(
             nn.Linear(times_ch, timenet_width), nn.ReLU(inplace=True),
             nn.Linear(timenet_width, timenet_output))
-            print('TiNeuVox: camnet', self.camnet)
+            if self.add_cam == True:
+                views_ch = 3 + 3 * viewbase_pe * 2 + timenet_output
+                self.camnet = nn.Sequential(
+                nn.Linear(times_ch, timenet_width), nn.ReLU(inplace=True),
+                nn.Linear(timenet_width, timenet_output))
+                print('TiNeuVox: camnet', self.camnet)
+                
+            self.deformation_net = Deformation(W=net_width, D=defor_depth, input_ch=3+3*posbase_pe*2, input_ch_time=timenet_output)
 
         featurenet_width = net_width
         featurenet_depth = 1
         grid_dim = voxel_channel * voxel_dim * (2 * gridbase_pe + 1)
-        input_dim = grid_dim + timenet_output + pts_ch
+        if voxel_type == 'tineuvox' or voxel_type == 'mhe':
+            input_dim = grid_dim + timenet_output + pts_ch
+        elif voxel_type == 'mhe4d':
+            input_dim = grid_dim
+        
         self.featurenet = nn.Sequential(
             nn.Linear(input_dim, featurenet_width), nn.ReLU(inplace=True),
             *[
@@ -149,25 +161,21 @@ class TiNeuVox(torch.nn.Module):
             ],
             )
         self.featurenet_width = featurenet_width
-        self._set_grid_resolution(num_voxels)
-        self.deformation_net = Deformation(W=net_width, D=defor_depth, input_ch=3+3*posbase_pe*2, input_ch_time=timenet_output)
         input_dim = featurenet_width
         self.densitynet = nn.Linear(input_dim, 1)
 
-        self.register_buffer('time_poc', torch.FloatTensor([(2**i) for i in range(timebase_pe)]))
-        self.register_buffer('grid_poc', torch.FloatTensor([(2**i) for i in range(gridbase_pe)]))
-        self.register_buffer('pos_poc', torch.FloatTensor([(2**i) for i in range(posbase_pe)]))
-        self.register_buffer('view_poc', torch.FloatTensor([(2**i) for i in range(viewbase_pe)]))
-
         self.voxel_dim = voxel_dim
         self.voxel_type = voxel_type
-        
         if voxel_type == 'tineuvox':
             self.feature= torch.nn.Parameter(torch.zeros([1, self.voxel_dim, *self.world_size],dtype=torch.float32))
             self.mhe_cfg = None
         elif voxel_type == 'mhe':
             self.feature = MultiHashtable(hashtable_cfg=mhe_cfg, xyz_min=xyz_min, xyz_max=xyz_max)
             self.mhe_cfg = mhe_cfg
+        elif voxel_type == 'mhe4d':
+            self.feature = MHE4d(hashtable_cfg=mhe_cfg, xyz_min=xyz_min, xyz_max=xyz_max, frame_cfg=frame_cfg)
+            self.mhe_cfg = mhe_cfg
+            self.frame_cfg = frame_cfg
         else:
             raise NotImplementedError()
         
@@ -175,11 +183,11 @@ class TiNeuVox(torch.nn.Module):
         
         if voxel_type == 'tineuvox':
             print('TiNeuVox: feature voxel grid', self.feature.shape)
-        print('TiNeuVox: timenet mlp', self.timenet)
-        print('TiNeuVox: deformation_net mlp', self.deformation_net)
-        print('TiNeuVox: densitynet mlp', self.densitynet)
-        print('TiNeuVox: featurenet mlp', self.featurenet)
-        print('TiNeuVox: rgbnet mlp', self.rgbnet)
+            print('TiNeuVox: timenet mlp', self.timenet)
+            print('TiNeuVox: deformation_net mlp', self.deformation_net)
+            print('TiNeuVox: densitynet mlp', self.densitynet)
+            print('TiNeuVox: featurenet mlp', self.featurenet)
+            print('TiNeuVox: rgbnet mlp', self.rgbnet)
 
     def _set_grid_resolution(self, num_voxels):
         # Determine grid resolution
@@ -212,21 +220,20 @@ class TiNeuVox(torch.nn.Module):
             'add_cam': self.add_cam,
             'voxel_type': self.voxel_type,
             'voxel_channel': self.voxel_channel,
-            'mhe_cfg': self.mhe_cfg
+            'mhe_cfg': self.mhe_cfg,
+            'frame_cfg': self.frame_cfg
         }
 
 
     @torch.no_grad()
     def scale_volume_grid(self, num_voxels):
+        print('TiNeuVox: scale_volume_grid start')
+        ori_world_size = self.world_size
+        self._set_grid_resolution(num_voxels)
+        print('TiNeuVox: scale_volume_grid scale world_size from', ori_world_size, 'to', self.world_size)
         if self.voxel_type == 'tineuvox':
-            print('TiNeuVox: scale_volume_grid start')
-            ori_world_size = self.world_size
-            self._set_grid_resolution(num_voxels)
-            print('TiNeuVox: scale_volume_grid scale world_size from', ori_world_size, 'to', self.world_size)
             self.feature = torch.nn.Parameter(
                 F.interpolate(self.feature.data, size=tuple(self.world_size), mode='trilinear', align_corners=True))
-        else:
-            pass
  
     def feature_total_variation_add_grad(self, weight, dense_mode):
         weight = weight * self.world_size.max() / 128
@@ -269,11 +276,11 @@ class TiNeuVox(torch.nn.Module):
             vox_feature_flatten = vox_feature
         return vox_feature_flatten
 
-    def set_ray_bounds(self, can_bounds):
-        self.ray_min = can_bounds[0]
-        self.ray_max = can_bounds[1]
-        assert torch.all(self.ray_min > self.xyz_min)
-        assert torch.all(self.ray_max < self.xyz_max)
+    # def set_ray_bounds(self, can_bounds):
+    #     self.ray_min = can_bounds[0]
+    #     self.ray_max = can_bounds[1]
+    #     assert torch.all(self.ray_min > self.xyz_min)
+    #     assert torch.all(self.ray_max < self.xyz_max)
         
     def sample_ray(self, rays_o, rays_d, near, far, stepsize, is_train=False, **render_kwargs):
         '''Sample query points on rays.
@@ -291,7 +298,7 @@ class TiNeuVox(torch.nn.Module):
         rays_d = rays_d.contiguous()
         stepdist = stepsize * self.voxel_size
         ray_pts, mask_outbbox, ray_id, step_id, N_steps, t_min, t_max = render_utils_cuda.sample_pts_on_rays(
-            rays_o, rays_d, self.ray_min, self.ray_max, near, far, stepdist)        
+            rays_o, rays_d, self.xyz_min, self.xyz_max, near, far, stepdist)        
         mask_inbbox = ~mask_outbbox
         ray_pts = ray_pts[mask_inbbox]
         ray_id = ray_id[mask_inbbox]
@@ -304,38 +311,47 @@ class TiNeuVox(torch.nn.Module):
         @rays_d:   [N, 3] the shooting direction of the N rays.
         @viewdirs: [N, 3] viewing direction to compute positional embedding for MLP.
         '''
-        assert len(rays_o.shape)==2 and rays_o.shape[-1]==3, 'Only suuport point queries in [N, 3] format'
-
-        ret_dict = {}
-        N = len(rays_o)
-        times_emb = poc_fre(times_sel, self.time_poc)
-        viewdirs_emb = poc_fre(viewdirs, self.view_poc)
-        times_feature = self.timenet(times_emb)
-        if self.add_cam==True:
-            cam_emb= poc_fre(cam_sel, self.time_poc)
-            cams_feature=self.camnet(cam_emb)
+        assert len(rays_o.shape) == 2 and rays_o.shape[-1] == 3, 'Only suuport point queries in [N, 3] format'
+        
         # sample points on rays
         ray_pts, ray_id, step_id, mask_inbbox= self.sample_ray(
                 rays_o=rays_o, rays_d=rays_d, is_train=global_step is not None, **render_kwargs)
-
-        # pts deformation 
-        rays_pts_emb = poc_fre(ray_pts, self.pos_poc)
-        ray_pts_delta = self.deformation_net(rays_pts_emb, times_feature[ray_id])
-        # computer bg_points_delta
-        if bg_points_sel is not None:
-            bg_points_sel_emb = poc_fre(bg_points_sel, self.pos_poc)
-            bg_points_sel_delta = self.deformation_net(bg_points_sel_emb, times_feature[:(bg_points_sel_emb.shape[0])])
-            ret_dict.update({'bg_points_delta': bg_points_sel_delta})
+        ret_dict = {}
+        N = len(rays_o)
         
-        # voxel query interp
-        if self.voxel_type == 'tineuvox':
-            vox_feature_flatten = self.mult_dist_interp(ray_pts_delta)
+        viewdirs_emb = poc_fre(viewdirs, self.view_poc)
+        if self.voxel_type == 'mhe4d':
+            time = times_sel[0]
+            time_pts = torch.ones_like(ray_pts[..., :1]) * time
+            voxel_feature_flatten = self.feature(ray_pts, time_pts)
+            voxel_feature_flatten_emb = poc_fre(voxel_feature_flatten, self.grid_poc)
+            h_feature = self.featurenet(voxel_feature_flatten_emb)
         else:
-            vox_feature_flatten = self.feature(ray_pts_delta)
+            times_emb = poc_fre(times_sel, self.time_poc)
+            times_feature = self.timenet(times_emb)
+            if self.add_cam==True:
+                cam_emb= poc_fre(cam_sel, self.time_poc)
+                cams_feature=self.camnet(cam_emb)
 
-        times_feature = times_feature[ray_id]
-        vox_feature_flatten_emb = poc_fre(vox_feature_flatten, self.grid_poc)
-        h_feature = self.featurenet(torch.cat((vox_feature_flatten_emb, rays_pts_emb, times_feature), -1))
+            # pts deformation 
+            rays_pts_emb = poc_fre(ray_pts, self.pos_poc)
+            ray_pts_delta = self.deformation_net(rays_pts_emb, times_feature[ray_id])
+            # computer bg_points_delta
+            if bg_points_sel is not None:
+                bg_points_sel_emb = poc_fre(bg_points_sel, self.pos_poc)
+                bg_points_sel_delta = self.deformation_net(bg_points_sel_emb, times_feature[:(bg_points_sel_emb.shape[0])])
+                ret_dict.update({'bg_points_delta': bg_points_sel_delta})
+            
+            # voxel query interp
+            if self.voxel_type == 'tineuvox':
+                voxel_feature_flatten = self.mult_dist_interp(ray_pts_delta)
+            else:
+                voxel_feature_flatten = self.feature(ray_pts_delta)
+
+            times_feature = times_feature[ray_id]
+            voxel_feature_flatten_emb = poc_fre(voxel_feature_flatten, self.grid_poc)
+            h_feature = self.featurenet(torch.cat((voxel_feature_flatten_emb, rays_pts_emb, times_feature), -1))
+        
         density_result = self.densitynet(h_feature)
 
         alpha = nn.Softplus()(density_result + self.act_shift)
