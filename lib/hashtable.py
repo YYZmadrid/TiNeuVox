@@ -47,7 +47,6 @@ class MultiHashtable(nn.Module):
             grid_size = ((xyz_max - xyz_min).prod() / grid_num) ** (1 / 3)
             world_size = ((xyz_max - xyz_min) / grid_size).astype(np.int32)
             self.entrys_num.append(world_size)
-            __import__('ipdb').set_trace()
             self.entrys_size.append((xyz_max - xyz_min) / (self.entrys_num[i] - 1))
         self.entrys_size = torch.tensor(self.entrys_size).float().cuda()
         self.entrys_num = torch.tensor(self.entrys_num).int().cuda()
