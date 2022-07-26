@@ -5,7 +5,7 @@ import time
 from tkinter import W
 
 import numpy as np
-from sympy import Mul
+from sympy import Mul, nonlinsolve
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,7 +63,7 @@ class Deformation(nn.Module):
         dx = self.query_time(input_pts, ts, self._time, self._time_out)
         input_pts_orig = input_pts[:, :3]
         out = input_pts_orig + dx
-        return out
+        return out, dx
 
 # Model
 class RGBNet(nn.Module):
@@ -366,7 +366,7 @@ class TiNeuVox(torch.nn.Module):
 
         h_feature = self.featurenet(torch.cat((voxel_feature_flatten_emb, rays_pts_emb, times_feature), -1))
         density_result = self.densitynet(h_feature)
-
+        
         alpha = nn.Softplus()(density_result + self.act_shift)
         alpha = alpha.squeeze(-1)
         if self.fast_color_thres > 0:
@@ -374,7 +374,9 @@ class TiNeuVox(torch.nn.Module):
             ray_id = ray_id[mask]
             step_id = step_id[mask]
             alpha = alpha[mask]
-            h_feature=h_feature[mask]
+            h_feature = h_feature[mask]
+            if self.voxel_type == 'tineuvox':
+                flow = flow[mask]
 
         # compute accumulated transmittance
         weights, alphainv_last = Alphas2Weights.apply(alpha, ray_id, N)
@@ -385,6 +387,8 @@ class TiNeuVox(torch.nn.Module):
             ray_id = ray_id[mask]
             step_id = step_id[mask]
             h_feature=h_feature[mask]
+            if self.voxel_type == 'tineuvox':
+                flow = flow[mask]
 
         viewdirs_emb_reshape = viewdirs_emb[ray_id]
         if self.add_cam == True:
@@ -414,7 +418,21 @@ class TiNeuVox(torch.nn.Module):
                     index=ray_id,
                     out=torch.zeros([N]),
                     reduce='sum')
-        ret_dict.update({'depth': depth})
+            
+            if flow is not None:
+                flow = torch.norm(flow, dim=-1, keepdim=False)
+                flow_marched = segment_coo(
+                    src=(weights * flow),
+                    index=ray_id, 
+                    out=torch.zeros([N]),
+                    reduce='sum')
+            else:
+                flow_marched = torch.zeros([N])
+            
+        ret_dict.update({
+            'depth': depth,
+            'flow': flow_marched
+        })
         return ret_dict
 
 class Alphas2Weights(torch.autograd.Function):
